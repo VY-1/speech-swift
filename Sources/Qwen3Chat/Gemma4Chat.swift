@@ -35,10 +35,6 @@ public final class Gemma4Chat: @unchecked Sendable {
     private var prefixSnapshots: [(tokens: [Int], state: Gemma4Model.InferenceState, bytes: Int)] = []
     private let prefixLock = NSLock()
 
-    /// `SPEECH_SWIFT_GEMMA4_PIPELINE=off` builds each step only after reading the previous token.
-    static let pipelined: Bool =
-        ProcessInfo.processInfo.environment["SPEECH_SWIFT_GEMMA4_PIPELINE"]?.lowercased() != "off"
-
     /// `SPEECH_SWIFT_GEMMA4_PREFIX_CACHE_MB`; 0 turns reuse off.
     static let prefixCacheBudget: Int = {
         let megabytes = ProcessInfo.processInfo.environment["SPEECH_SWIFT_GEMMA4_PREFIX_CACHE_MB"]
@@ -249,7 +245,7 @@ public final class Gemma4Chat: @unchecked Sendable {
             remaining -= 1
             if let mask, mask.isEmpty { failure = .noAdmissibleToken; break }
 
-            let sampled = ChatSampler.sampleOnDevice(
+            let next = ChatSampler.sampleOnDevice(
                 logits: logits,
                 config: sampling,
                 // Don't let the model end the turn before emitting any visible answer, and never
@@ -261,20 +257,7 @@ public final class Gemma4Chat: @unchecked Sendable {
                 vocabSize: denseConfig.vocabSize,
                 uniform: sampling.temperature > 0 ? Float.random(in: 0 ..< 1) : 0,
                 allowed: mask
-            )
-
-            // Queue the next step on the token before it is read. Reading a token waits for the
-            // GPU, and the next step's graph used to be built only after that wait, so the CPU
-            // building it and the GPU running it never overlapped. Built on the still-lazy token,
-            // the forward runs straight after the draw. When the token turns out to end the reply,
-            // one forward is spent for nothing.
-            var ahead: MLXArray?
-            if Self.pipelined && remaining > 0 {
-                ahead = model.forward(
-                    inputIds: sampled.asType(.int32).reshaped([1, 1]), state: &state)
-                asyncEval(ahead!)
-            }
-            let next = sampled.item(Int.self)
+            ).item(Int.self)
 
             if gemmaTokenizer.eosTokenIds.contains(next) { break }
             if constraint != nil, !constraint!.accept(next) { failure = .noAdmissibleToken; break }
@@ -290,14 +273,10 @@ public final class Gemma4Chat: @unchecked Sendable {
             // Decode one step — but not a step whose logits nothing will read. The budget's last
             // token used to be followed by a full forward that was evaluated and thrown away.
             guard remaining > 0 else { break }
-            if let ahead {
-                logits = ahead
-            } else {
-                let arr = MLXArray([Int32(next)]).expandedDimensions(axis: 0)
-                logits = model.forward(inputIds: arr, state: &state)
-                if constraint != nil { asyncEval(logits) }
-            }
+            let arr = MLXArray([Int32(next)]).expandedDimensions(axis: 0)
+            logits = model.forward(inputIds: arr, state: &state)
             if constraint != nil {
+                asyncEval(logits)
                 mask = constraint!.nextMask()
             }
         }

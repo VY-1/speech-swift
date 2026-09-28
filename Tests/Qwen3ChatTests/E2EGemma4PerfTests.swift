@@ -1,6 +1,8 @@
 import XCTest
 import Foundation
 import MLX
+import MLXNN
+import MLXRandom
 @testable import Qwen3Chat
 
 /// Where a Gemma 4 request spends its time: reading the prompt, and each generated token, with and
@@ -42,6 +44,47 @@ final class E2EGemma4PerfTests: XCTestCase {
         let start = DispatchTime.now().uptimeNanoseconds
         body()
         return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+    }
+
+    /// One decode step's GPU time taken apart: the 42 MLPs chained with nothing else, the tied
+    /// output projection, and the whole step. Each piece's bytes over its time is the bandwidth it
+    /// reaches; what the whole step spends beyond its pieces is small-kernel work between them.
+    func testWhereADecodeStepSpendsItsTime() throws {
+        let chat = try loadChat()
+        let model = chat.model
+        let x = MLXRandom.normal([1, 1, chat.denseConfig.hiddenSize]).asType(.bfloat16)
+        eval(x)
+        func timed(_ label: String, bytes: Double, repeats: Int = 40, _ body: () -> MLXArray) {
+            eval(body())
+            let t = seconds { for _ in 0 ..< repeats { eval(body()) } } / Double(repeats)
+            print(String(format: "[gemma4-perf] %@: %.2f ms, %.0f GB/s", label, t * 1000,
+                         bytes / t / 1e9))
+        }
+        func weightBytes(_ module: Module) -> Double {
+            Double(module.parameters().flattened().reduce(0) { $0 + $1.1.nbytes })
+        }
+        let mlpBytes = model.layers.reduce(0.0) { $0 + weightBytes($1.mlp) }
+        timed("42 MLPs chained", bytes: mlpBytes) {
+            var h = x
+            for layer in model.layers { h = layer.mlp(h) }
+            return h
+        }
+        timed("one MLP", bytes: weightBytes(model.layers[0].mlp)) { model.layers[0].mlp(x) }
+        timed("output projection", bytes: weightBytes(model.embedTokens)) {
+            model.embedTokens.asLinear(x)
+        }
+        let attnBytes = model.layers.reduce(0.0) { $0 + weightBytes($1.attn) }
+        let allBytes = weightBytes(model) - weightBytes(model.embedTokensPerLayer)
+        print(String(format: "[gemma4-perf] weights read per token: MLP %.2f GB, attention %.2f GB, all but PLE table %.2f GB",
+                     mlpBytes / 1e9, attnBytes / 1e9, allBytes / 1e9))
+        // The whole step, against a short cache.
+        var state = Gemma4Model.InferenceState.initial(config: chat.denseConfig)
+        eval(model.lastTokenLogits(
+            inputIds: MLXArray((0 ..< 200).map { Int32(1000 + $0) }).expandedDimensions(axis: 0),
+            state: &state))
+        timed("whole decode step", bytes: allBytes) {
+            model.forward(inputIds: MLXArray([Int32(100)]).expandedDimensions(axis: 0), state: &state)
+        }
     }
 
     func testWhereARequestSpendsItsTime() throws {
@@ -113,8 +156,9 @@ final class E2EGemma4PerfTests: XCTestCase {
         }
         print(String(format: "[gemma4-perf] forward only: %.1f ms/token", forward * 1000 / Double(steps)))
 
-        // The same steps split into building the lazy graph on the CPU and running it: what a
-        // pipelined loop could hide behind the GPU.
+        // The same steps split into building the lazy graph on the CPU and running it. Measured
+        // 2026-09-28 on an M5 Pro: about 1 ms of about 18, so overlapping the two (pipelining
+        // the step on the unread token) was tried and bought nothing measurable.
         var build = 0.0, run = 0.0
         for _ in 0 ..< steps {
             var logits: MLXArray!
