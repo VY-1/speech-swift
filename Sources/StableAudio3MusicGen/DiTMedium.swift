@@ -374,7 +374,10 @@ public final class DiTMedium: Module {
         if let lc = localAddCond {
             local = lc
         } else {
-            local = MLXArray.zeros([B, tLat, DiTMediumDims.localAddCondDim], dtype: xPP.dtype)
+            // Zero local-add-cond at the INPUT length (not the baked `tLat`),
+            // so one loaded model runs any sequence length — mirrors upstream
+            // dit_mlx.py, which explicitly avoids the baked-size shortcut.
+            local = MLXArray.zeros([B, x.dim(2), DiTMediumDims.localAddCondDim], dtype: xPP.dtype)
         }
 
         let h = transformer(xPP, context: context, globalEmbed: globalEmbed,

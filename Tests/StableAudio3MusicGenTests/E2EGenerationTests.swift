@@ -9,6 +9,10 @@ import MLX
 final class E2EGenerationTests: XCTestCase {
 
     func testGenerateMediumInt8ShortClip() async throws {
+        // Load hint (2 s) is deliberately MISMATCHED against the generated
+        // length (3 s): the baked-tLat crash this guards against only appears
+        // when the two differ, which is exactly what production does (15 s
+        // load hint vs 60 s first chunk).
         let model = try await StableAudio3MusicGen.fromPretrained(
             variant: .mediumInt8,
             tLatHint: StableAudio3MusicGen.computeTLat(seconds: 2.0))
@@ -16,11 +20,11 @@ final class E2EGenerationTests: XCTestCase {
         let (left, right) = model.generate(
             prompt: "lofi house loop",
             params: StableAudio3GenerationParams(
-                seconds: 2.0, steps: 4, cfgScale: 1.0,
+                seconds: 3.0, steps: 4, cfgScale: 1.0,
                 sigmaMax: 1.0, seed: 42))
 
-        XCTAssertEqual(left.count, 2 * SA3Audio.sampleRate,
-                       "Expected exactly 2 s × 44.1 kHz frames per channel")
+        XCTAssertEqual(left.count, 3 * SA3Audio.sampleRate,
+                       "Expected exactly 3 s × 44.1 kHz frames per channel")
         XCTAssertEqual(left.count, right.count, "Stereo channel lengths must match")
 
         // Audio must be finite (no NaN/Inf) and non-silent.
