@@ -287,16 +287,16 @@ public final class SAMELDecoder: Module {
 /// Uniform-kernel chunked decode. Mirrors `decode_chunked` in the upstream
 /// Python — no zero-padding, three segments (first/interior/last) each see
 /// `kernel = chunk + 2*overlap` real latents.
-public func sameLDecodeChunked(_ model: SAMELDecoder, latents: MLXArray,
+public func sameLDecodeChunked(_ model: SA3AudioDecoder, latents: MLXArray,
                                 chunkSize: Int, overlap: Int) -> MLXArray {
     let T = latents.dim(2)
     let kernel = chunkSize + 2 * overlap
-    if T <= kernel { return model(latents) }
+    if T <= kernel { return model.callAsFunction(latents, fullAttention: false) }
 
     var pieces: [MLXArray] = []
 
     // 1) First decode covers output positions [0, chunk + overlap)
-    let firstOut = model(latents[0..., 0..., 0..<kernel])
+    let firstOut = model.callAsFunction(latents[0..., 0..., 0..<kernel], fullAttention: false)
     let validFirst = chunkSize + overlap
     pieces.append(firstOut[0..., 0..., 0..<(validFirst * SAMELDims.sinPerPos)])
     var i = validFirst
@@ -305,7 +305,7 @@ public func sameLDecodeChunked(_ model: SAMELDecoder, latents: MLXArray,
     while i + chunkSize + overlap <= T {
         let lo = i - overlap
         let hi = i + chunkSize + overlap
-        let out = model(latents[0..., 0..., lo..<hi])
+        let out = model.callAsFunction(latents[0..., 0..., lo..<hi], fullAttention: false)
         let pieceLo = overlap * SAMELDims.sinPerPos
         let pieceHi = (overlap + chunkSize) * SAMELDims.sinPerPos
         pieces.append(out[0..., 0..., pieceLo..<pieceHi])
@@ -315,10 +315,12 @@ public func sameLDecodeChunked(_ model: SAMELDecoder, latents: MLXArray,
     // 3) Last decode covers remaining (T - i) output positions
     let remaining = T - i
     if remaining > 0 {
-        let lastOut = model(latents[0..., 0..., (T - kernel)..<T])
+        let lastOut = model.callAsFunction(latents[0..., 0..., (T - kernel)..<T], fullAttention: false)
         let tail = remaining * SAMELDims.sinPerPos
         let total = lastOut.dim(2)
         pieces.append(lastOut[0..., 0..., (total - tail)..<total])
     }
     return MLX.concatenated(pieces, axis: -1)
 }
+
+extension SAMELDecoder: SA3AudioDecoder {}

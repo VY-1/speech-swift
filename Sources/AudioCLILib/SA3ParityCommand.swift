@@ -99,7 +99,7 @@ public struct SA3ParityCommand: ParsableCommand {
         let crossAttn = refArrs["cross_attn"]!.asType(DType.float16)
         let globalCond = refArrs["global_cond"]!.asType(DType.float16)
         let t = refArrs["t"]!.asType(DType.float16)
-        let vSwift = model.dit(noise, t: t,
+        let vSwift = model.dit.callAsFunction(noise, t: t,
                                 crossAttnCondRaw: crossAttn,
                                 globalCondRaw: globalCond, localAddCond: nil)
         eval(vSwift)
@@ -109,7 +109,7 @@ public struct SA3ParityCommand: ParsableCommand {
         // ─── Stage 4: SAME-L decoder ─────────────────────────────────────
         print("\n[4] SAME-L decode (denoised → patches)")
         let denoised = refArrs["denoised"]!.asType(DType.float32)
-        let patchesSwift = model.decoder(denoised)
+        let patchesSwift = model.decoder.callAsFunction(denoised, fullAttention: false)
         eval(patchesSwift)
         compare(label: "patches", swift: patchesSwift.asType(DType.float32),
                 ref: refArrs["patches"]!.asType(DType.float32))

@@ -8,9 +8,8 @@ import Foundation
 /// rest meant a selectable variant that failed at download time. Add a case
 /// back when its bundle is published.
 ///
-/// Note that `.smallMusicInt4` is published but not yet loadable:
-/// `fromPretrained` throws `unsupportedFamily` for everything except the
-/// Medium family, whose DiT/SAME-L path is the only one wired up so far.
+/// Both published variants are loadable: `.mediumInt8` routes to the
+/// DiT-Medium + SAME-L stack, `.smallMusicInt4` to DiT-Small + SAME-S.
 ///
 /// All bundles ship the matching SAME codec (SAME-L for Medium, SAME-S for
 /// the Small variants) and T5Gemma text encoder alongside the DiT.
@@ -40,6 +39,15 @@ public enum StableAudio3Variant: String, Sendable, CaseIterable {
         switch self {
         case .mediumInt8:     return .medium
         case .smallMusicInt4: return .smallMusic
+        }
+    }
+
+    /// DiT I/O latent channels — 256 for every published family.
+    public var ioChannels: Int {
+        switch family {
+        case .medium:     return DiTMediumDims.ioChannels
+        case .smallMusic: return DiTSmallDims.ioChannels
+        case .smallSFX:   return DiTSmallDims.ioChannels
         }
     }
 }
@@ -106,6 +114,9 @@ public enum SAMELDims {
 }
 
 /// SAME-S decoder constants (mirror same_s_decoder.py).
+///
+/// Note: SAME-S has **no** sinusoidal feed-forward gate on any block (every
+/// FF uses SiLU), so unlike SAME-L there is no `sinStartBlock` here.
 public enum SAMESDims {
     public static let latentDim = 256
     public static let dim = 768
@@ -114,11 +125,16 @@ public enum SAMESDims {
     public static let ropeDims = 32
     public static let numBlocks = 6
     public static let ffInner = 2304
-    public static let sinStartBlock = 5
     public static let outChannels = 512
     public static let stride = 16
     public static let subChunkSize = stride + 1
     public static let sinPerPos = subChunkSize - 1
+    /// Chunk-midpoint-shift constants: blocks 0–2 see non-overlapping
+    /// `effectiveChunk = 32 + 32/16 = 34` windows; blocks 3–5 see the same
+    /// sequence shifted by `shift = 17` on both ends.
+    public static let chunkSizeLat = 32
+    public static let effectiveChunk = chunkSizeLat + chunkSizeLat / stride  // 34
+    public static let shift = effectiveChunk / 2                             // 17
     public static let ropeBase: Float = 10000.0
 }
 

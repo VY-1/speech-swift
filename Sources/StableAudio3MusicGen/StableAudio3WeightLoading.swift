@@ -42,13 +42,14 @@ func sa3ApplyFlatWeights(into module: Module, mapping: [String: MLXArray]) throw
     try module.update(parameters: params, verify: .shapeMismatch)
 }
 
-/// Rewrite checkpoint keys for the DiT (medium) so that the numeric-string
-/// indices `.0.` / `.2.` (which MLX-Swift would deserialize as a 3-element
-/// list with a `none` at index 1) become named children `.inProj.` / `.outProj.`
-/// for the conditioner MLPs and `.glu.` / `.out.` for the GeGLU feed-forward.
+/// Rewrite checkpoint keys for the DiT (both families — Medium and Small
+/// share the key layout) so that the numeric-string indices `.0.` / `.2.`
+/// (which MLX-Swift would deserialize as a 3-element list with a `none` at
+/// index 1) become named children `.inProj.` / `.outProj.` for the
+/// conditioner MLPs and `.glu.` / `.out.` for the GeGLU feed-forward.
 /// This lets `update(parameters:)` consume a `Module` with named ModuleInfo
 /// children instead of a `[Module?]` array.
-func sa3RewriteDiTMediumKeys(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+func sa3RewriteDiTKeys(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     let twoLinearOwners: [String] = [
         "to_cond_embed", "to_global_embed", "to_timestep_embed",
         "transformer.global_cond_embedder",
@@ -107,14 +108,11 @@ func sa3StripPrefix(_ weights: [String: MLXArray], prefix: String) -> [String: M
     return out
 }
 
-/// Load + finalize the DiT (medium INT8/INT4). Returns `(model, conditioner)`
-/// where the conditioner is the SecondsTotalEmbedder + learned padding
-/// embedding bundled into the DiT safetensors under the `cond.` prefix.
-func sa3LoadDiTMedium(dir: URL, tLat: Int, bits: Int) throws
-    -> (model: DiTMedium, padding: MLXArray, secondsEmbedder: SecondsTotalEmbedder) {
-    var raw = try sa3LoadBundleComponent(dir)
-
-    // Extract the conditioner triplet before we hand the rest to load.
+/// Extract the conditioner triplet (`cond.padding_embedding`,
+/// `cond.seconds_total_{weight,bias}`) bundled under the `cond.` prefix in
+/// every DiT safetensors, consuming those keys from `raw`.
+func sa3ExtractDiTConditioner(_ raw: inout [String: MLXArray]) throws
+    -> (padding: MLXArray, secondsEmbedder: SecondsTotalEmbedder) {
     let padKey = "cond.padding_embedding"
     let secsWKey = "cond.seconds_total_weight"
     let secsBKey = "cond.seconds_total_bias"
@@ -129,12 +127,50 @@ func sa3LoadDiTMedium(dir: URL, tLat: Int, bits: Int) throws
     }
     let secondsEmbedder = SecondsTotalEmbedder(
         weight: secsW.asType(.float32), bias: secsB.asType(.float32))
+    return (padding, secondsEmbedder)
+}
+
+/// Load + finalize the DiT-Medium (INT8/INT4). Returns `(model, conditioner)`
+/// where the conditioner is the SecondsTotalEmbedder + learned padding
+/// embedding bundled into the DiT safetensors under the `cond.` prefix.
+func sa3LoadDiTMedium(dir: URL, tLat: Int, bits: Int) throws
+    -> (model: DiTMedium, padding: MLXArray, secondsEmbedder: SecondsTotalEmbedder) {
+    var raw = try sa3LoadBundleComponent(dir)
+    let (padding, secondsEmbedder) = try sa3ExtractDiTConditioner(&raw)
 
     let model = DiTMedium(tLat: tLat, bits: bits)
-    let rewritten = sa3RewriteDiTMediumKeys(raw)
+    let rewritten = sa3RewriteDiTKeys(raw)
     try sa3ApplyFlatWeights(into: model, mapping: rewritten)
     eval(model.parameters())
     return (model, padding.asType(.float32), secondsEmbedder)
+}
+
+/// Load + finalize the DiT-Small (INT4/INT8 — `dit_sm_music`). Bundle layout
+/// is identical to Medium (same `cond.` triplet, same list-indexed
+/// conditioner keys); only the module differs.
+func sa3LoadDiTSmall(dir: URL, tLat: Int, bits: Int) throws
+    -> (model: DiTSmall, padding: MLXArray, secondsEmbedder: SecondsTotalEmbedder) {
+    var raw = try sa3LoadBundleComponent(dir)
+    let (padding, secondsEmbedder) = try sa3ExtractDiTConditioner(&raw)
+
+    let model = DiTSmall(tLat: tLat, bits: bits)
+    let rewritten = sa3RewriteDiTKeys(raw)
+    try sa3ApplyFlatWeights(into: model, mapping: rewritten)
+    eval(model.parameters())
+    return (model, padding.asType(.float32), secondsEmbedder)
+}
+
+/// Permute the SAME-S `mapping.weight` from the PyTorch Conv1d layout
+/// `(out, in, k)` to MLX's `(out, k, in)` — a no-op when the tensor already
+/// ships in MLX layout. The published bundle stores the PyTorch form
+/// (`[512, 768, 3]`).
+func sa3PermuteSAMEMapping(_ raw: [String: MLXArray]) -> [String: MLXArray] {
+    guard let w = raw["mapping.weight"], w.ndim == 3, w.dim(2) == 3 else {
+        return raw
+    }
+    var out = raw
+    out["mapping.weight"] = w.transposed(0, 2, 1)
+    return out
 }
 
 /// Load SAME-L decoder. Reshapes the `mapping.weight` from PyTorch Conv1d
@@ -145,6 +181,16 @@ func sa3LoadSAMELDecoder(dir: URL) throws -> SAMELDecoder {
         raw["mapping.weight"] = w.reshaped([w.dim(0), w.dim(1)])
     }
     let model = SAMELDecoder()
+    try sa3ApplyFlatWeights(into: model, mapping: raw)
+    eval(model.parameters())
+    return model
+}
+
+/// Load SAME-S decoder (k=3 mapping conv, PyTorch weight layout permuted to
+/// MLX's `(out, k, in)`).
+func sa3LoadSAMESDecoder(dir: URL) throws -> SAMESDecoder {
+    let raw = sa3PermuteSAMEMapping(try sa3LoadBundleComponent(dir))
+    let model = SAMESDecoder()
     try sa3ApplyFlatWeights(into: model, mapping: raw)
     eval(model.parameters())
     return model

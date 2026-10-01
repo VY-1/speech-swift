@@ -25,7 +25,7 @@ speech compose "cinematic trailer drums" \
 | Flag | Meaning |
 |---|---|
 | `--engine sa3` | Select Stable Audio 3. This is the default. |
-| `--sa3-variant` | `medium-int8` (default). `small-music-int4` is published but not yet loadable — see Current Limits. |
+| `--sa3-variant` | `medium-int8` (default) → DiT-Medium + SAME-L; `small-music-int4` → DiT-Small + SAME-S (~50 M DiT, much lighter). |
 | `--seconds` | Output duration in seconds. |
 | `--sa3-steps` | Ping-pong sampler steps. Default: 8. |
 | `--sa3-cfg` | Classifier-free guidance. `1.0` disables CFG. |
@@ -61,9 +61,10 @@ try WAVWriter.writeStereo(
 
 ## Current Limits
 
-- Only the Medium family is wired for generation today. `small-music-int4`
-  resolves and downloads but `fromPretrained` throws `unsupportedFamily` until
-  the DiT/SAME-S path is implemented.
+- Both published variants generate: `medium-int8` (DiT-Medium + SAME-L) and
+  `small-music-int4` (DiT-Small + SAME-S). SAME-S rounds the requested latent
+  count up to an even length — its internal attention reshape requires
+  `T_lat × 17 % 34 == 0` — and the output is cropped to the requested length.
 - Of the six variants the export pipeline can build, only two were ever
   published: `medium-int8` and `small-music-int4`. The four unpublished ones
   were removed from `StableAudio3Variant` because selecting them failed at

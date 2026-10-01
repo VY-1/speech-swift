@@ -31,18 +31,35 @@ public struct StableAudio3GenerationParams: Sendable {
     }
 }
 
+// MARK: - Denoiser / decoder protocols (family-erased storage)
+
+/// The DiT denoiser contract every family implements: velocity prediction
+/// from (latents, sigma, cross-attn cond, global cond).
+public protocol SA3Denoiser: AnyObject {
+    func callAsFunction(_ x: MLXArray, t: MLXArray,
+                        crossAttnCondRaw: MLXArray, globalCondRaw: MLXArray,
+                        localAddCond: MLXArray?) -> MLXArray
+}
+
+/// The latent→patch decoder contract every SAME family implements.
+/// `fullAttention` is meaningful for SAME-L only (SAME-S ignores it — its
+/// attention window is whatever the caller reshaped to).
+public protocol SA3AudioDecoder: AnyObject {
+    func callAsFunction(_ latents: MLXArray, fullAttention: Bool) -> MLXArray
+}
+
 // MARK: - Main entry point
 
 public final class StableAudio3MusicGen {
     public let variant: StableAudio3Variant
     public let t5: T5GemmaText
-    public let dit: DiTMedium                 // medium only in this initial port
-    public let decoder: SAMELDecoder          // SAME-L for medium
+    public let dit: any SA3Denoiser            // DiT-Medium or DiT-Small
+    public let decoder: any SA3AudioDecoder    // SAME-L or SAME-S
     public let padding: MLXArray              // [768]
     public let secondsEmbedder: SecondsTotalEmbedder
 
     private init(variant: StableAudio3Variant,
-                 t5: T5GemmaText, dit: DiTMedium, decoder: SAMELDecoder,
+                 t5: T5GemmaText, dit: any SA3Denoiser, decoder: any SA3AudioDecoder,
                  padding: MLXArray, secondsEmbedder: SecondsTotalEmbedder) {
         self.variant = variant
         self.t5 = t5
@@ -57,29 +74,40 @@ public final class StableAudio3MusicGen {
     /// Download and load a published SA3 bundle. The default variant is
     /// `.mediumInt8` — corresponding to `aufklarer/Stable-Audio-3-DiT-Medium-MLX-8bit`.
     ///
-    /// Only the Medium DiT family is supported in this initial port. Small DiT
-    /// variants (sm-music, sm-sfx) will throw `.unsupportedFamily`.
+    /// Family routing: `.medium*` → DiT-Medium + SAME-L;
+    /// `.smallMusic*` / `.smallSFX*` → DiT-Small + SAME-S.
     public static func fromPretrained(
         variant: StableAudio3Variant = .mediumInt8,
         tLatHint: Int? = nil,
         localBundleOverride: URL? = nil,
         progressHandler: ((Double) -> Void)? = nil
     ) async throws -> StableAudio3MusicGen {
-        guard variant.family == .medium else {
-            throw StableAudio3Error.unsupportedFamily(
-                "Only the Medium DiT family is wired up in this port — got family=\(variant.family). "
-              + "Use --engine magnet for now if you need the small variant."
-            )
-        }
         let paths = try await StableAudio3Downloader.ensureDownloaded(
             variant: variant,
             localBundleOverride: localBundleOverride,
             progressHandler: progressHandler)
 
         let tLat = tLatHint ?? computeTLat(seconds: 30.0)
-        let (ditModel, padding, secsEmb) = try sa3LoadDiTMedium(
-            dir: paths.dit, tLat: tLat, bits: variant.bits)
-        let decoder = try sa3LoadSAMELDecoder(dir: paths.sameDecoder)
+        let ditModel: any SA3Denoiser
+        let decoder: any SA3AudioDecoder
+        let padding: MLXArray
+        let secsEmb: SecondsTotalEmbedder
+        switch variant.family {
+        case .medium:
+            let (model, pad, secs) = try sa3LoadDiTMedium(
+                dir: paths.dit, tLat: tLat, bits: variant.bits)
+            ditModel = model
+            decoder = try sa3LoadSAMELDecoder(dir: paths.sameDecoder)
+            padding = pad
+            secsEmb = secs
+        case .smallMusic, .smallSFX:
+            let (model, pad, secs) = try sa3LoadDiTSmall(
+                dir: paths.dit, tLat: tLat, bits: variant.bits)
+            ditModel = model
+            decoder = try sa3LoadSAMESDecoder(dir: paths.sameDecoder)
+            padding = pad
+            secsEmb = secs
+        }
         let t5 = try sa3LoadT5Gemma(dir: paths.t5gemma)
 
         return StableAudio3MusicGen(
@@ -123,8 +151,14 @@ public final class StableAudio3MusicGen {
             : MLXArray.zeros(crossAttn.shape, dtype: dtype)
 
         // 2) Initial latent
-        let tLat = Self.computeTLat(seconds: params.seconds)
-        let noise = MLXRandom.normal([1, DiTMediumDims.ioChannels, tLat], dtype: dtype)
+        var tLat = Self.computeTLat(seconds: params.seconds)
+        if variant.family != .medium {
+            // SAME-S attention reshapes need T_lat × 17 ≡ 0 (mod 34) — i.e. an
+            // even latent count. Round up one latent when needed; the output is
+            // cropped to the requested length below anyway.
+            if tLat % 2 != 0 { tLat += 1 }
+        }
+        let noise = MLXRandom.normal([1, variant.ioChannels, tLat], dtype: dtype)
         eval(noise)
 
         // 3) DiT sampling (rectified-flow pingpong)
@@ -134,16 +168,16 @@ public final class StableAudio3MusicGen {
         let apg = params.apg
         let modelFn: (MLXArray, MLXArray) -> MLXArray = { [unowned self] x, t in
             if cfg == 1.0 {
-                return self.dit(x, t: t, crossAttnCondRaw: crossAttn, globalCondRaw: globalCond,
-                                 localAddCond: nil)
+                return self.dit.callAsFunction(x, t: t, crossAttnCondRaw: crossAttn,
+                                               globalCondRaw: globalCond, localAddCond: nil)
             }
             // Batched CFG: cat([x, x]) on the batch dim.
             let x2 = MLX.concatenated([x, x], axis: 0)
             let t2 = MLX.concatenated([t, t], axis: 0)
             let cross2 = MLX.concatenated([crossAttn, nullCrossAttn!], axis: 0)
             let global2 = MLX.concatenated([globalCond, globalCond], axis: 0)
-            let vBatched = self.dit(x2, t: t2, crossAttnCondRaw: cross2, globalCondRaw: global2,
-                                     localAddCond: nil)
+            let vBatched = self.dit.callAsFunction(x2, t: t2, crossAttnCondRaw: cross2,
+                                                   globalCondRaw: global2, localAddCond: nil)
             let halves = MLX.split(vBatched, parts: 2, axis: 0)
             let condV = halves[0], uncondV = halves[1]
             let sigma = t.reshaped([-1, 1, 1]).asType(.float32)
@@ -180,9 +214,11 @@ public final class StableAudio3MusicGen {
         let kernel = 128 + 2 * 8   // chunked decode defaults from upstream
         let patches: MLXArray
         if tLat > kernel {
-            patches = sameLDecodeChunked(decoder, latents: latentsFP32, chunkSize: 128, overlap: 8)
+            patches = variant.family == .medium
+                ? sameLDecodeChunked(decoder, latents: latentsFP32, chunkSize: 128, overlap: 8)
+                : sameSDecodeChunked(decoder, latents: latentsFP32, chunkSize: 128, overlap: 8)
         } else {
-            patches = decoder(latentsFP32)
+            patches = decoder.callAsFunction(latentsFP32, fullAttention: false)
         }
         eval(patches)
 
